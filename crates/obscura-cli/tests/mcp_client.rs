@@ -7,6 +7,39 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 const OBSCURA: &str = env!("CARGO_BIN_EXE_obscura");
+
+#[test]
+fn mcp_font_directory_is_validated_before_either_transport_starts() {
+    let missing = std::env::temp_dir().join(format!("obscura-missing-fonts-{}", std::process::id()));
+    assert!(!missing.exists());
+    for http in [false, true] {
+        let mut command = Command::new(OBSCURA);
+        command.args(["mcp", "--font-dir"]).arg(&missing).stdin(Stdio::null());
+        if http {
+            command.args(["--http", "--port", "0"]);
+        }
+        let output = command.output().expect("start MCP with invalid font directory");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Font directory does not exist"));
+    }
+}
+
+#[test]
+fn mcp_font_directory_respects_render_feature() {
+    let output = Command::new(OBSCURA)
+        .args(["mcp", "--font-dir"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("start MCP with existing font directory");
+    if cfg!(feature = "render") {
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    } else {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--font-dir requires a render-enabled build"));
+    }
+}
+
 const TEST_PAGE: &str = r#"<!doctype html><html><head><title>Example Domain</title></head>
 <body><h1>Example Domain</h1><p>Deterministic local MCP fixture.</p>
 <a href="/more">More information...</a></body></html>"#;
@@ -16,6 +49,12 @@ const QUEUED_NAVIGATION_SELECTOR: &str = "#queued";
 const QUEUED_NAVIGATION_TITLE: &str = "queued-task-finished";
 const TIMER_TEST_INITIAL_PAGE: &str = "data:text/html,<title>initial</title>";
 const TIMER_TEST_TIMEOUT_SECONDS: u64 = 1;
+const INLINE_TEXT_URL: &str = "data:text/html,\
+<html><body>\
+<h1><span>H</span><span>e</span><span>l</span><span>l</span><span>o</span>%20\
+<span>w</span><span>o</span><span>r</span><span>l</span><span>d</span><span>.</span></h1>\
+<p><span>Hello</span><span>,</span>%20<span>world</span><span>!</span></p>\
+</body></html>";
 
 /// A loopback fixture keeps protocol tests independent of public-site bot
 /// policy, DNS, and content changes. The previous example.com dependency can
@@ -40,6 +79,8 @@ impl TestPageServer {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets inherit nonblocking mode on macOS.
+                        stream.set_nonblocking(false).expect("blocking fixture client");
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                         let mut request = [0u8; 2048];
                         let _ = stream.read(&mut request);
@@ -200,6 +241,27 @@ fn test_initialize() {
     );
     assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
     assert_eq!(resp["result"]["serverInfo"]["name"], "obscura-mcp");
+}
+
+#[test]
+fn snapshot_preserves_whitespace_between_inline_spans() {
+    let mut client = McpClient::spawn();
+    let navigation = client.tool(
+        "browser_navigate",
+        serde_json::json!({ "url": INLINE_TEXT_URL }),
+    );
+    assert!(
+        navigation.get("error").is_none(),
+        "navigation failed: {navigation}"
+    );
+
+    let snapshot = client.tool("browser_snapshot", serde_json::json!({}));
+    let text = content_text(&snapshot);
+    assert!(
+        text.contains("Hello world.\n\nHello, world!"),
+        "snapshot mangled inline text: {text}"
+    );
+    assert!(!text.contains("H e l l o"), "snapshot inserted spaces: {text}");
 }
 
 #[test]
